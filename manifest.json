@@ -1,0 +1,34 @@
+{
+  "name": "rx185-eap-method-cards-v0",
+  "version": "v0",
+  "created_at": "2026-04-30",
+  "license": "Apache-2.0",
+  "purpose": "Offline method package for ARC-AGI-3 Kaggle agents. Loads on notebook startup as /kaggle/input/rx185-eap-method-cards-v0/.",
+  "scope": "Method-level reasoning cards only. No per-game answer traces, no gold traces, no oracle action sequences.",
+  "consumers": [
+    "KAGGLE_R0_RX185_EAP_GEMMA4B_V6.py",
+    "KAGGLE_R0_RX185_EAP_GEMMA4B_V6.ipynb"
+  ],
+  "files": [
+    {
+      "path": "cards/arc_agi3_protocol_cards.jsonl",
+      "size": 6973,
+      "sha256": "18f4b24838fb7e015c368fc96564e33f22da31097f049d71bdc01744147ae8d5"
+    },
+    {
+      "path": "cards/eap_core.md",
+      "size": 3403,
+      "sha256": "df2f6d28610e5735b088683ce8bdea489ff315a891ec7d53fe2d307145a49dae"
+    },
+    {
+      "path": "cards/first_principles_cards.jsonl",
+      "size": 6198,
+      "sha256": "c2ebdfc3baa9982715cf6d50ce7120090fa79ff2b2e72f5c0ec9d17fe6a03722"
+    },
+    {
+      "path": "cards/forbidden_actions.json",
+      "size": 2153,
+      "sha256": "c57b37f8e316920c9f957134fc7bfa69a39c25a2e2767e6513255b7d203f522f"
+    }
+  ]
+}
