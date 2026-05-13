@@ -257,6 +257,46 @@ fn scenario_e_startup_verify_sets_red_stop() {
     );
 }
 
+// ─── Regression: lease renew must work after acquire (status encoding) ────────
+#[test]
+fn lease_renew_succeeds_after_acquire() {
+    let db = fresh_db();
+    let mgr = LeaseManager::new(&db);
+
+    let lease_id = mgr
+        .acquire(LeaseScope::TelegramPoller, "poller-A", TELEGRAM_POLLER_LEASE_TTL_SECS)
+        .expect("acquire");
+
+    // Renew must find the row — guards against the bug where acquire stored
+    // `"active"` (JSON-encoded) but renew queried `'active'` (literal).
+    mgr.renew(lease_id, "poller-A").expect("renew should succeed");
+}
+
+// ─── Regression: command_id is canonical under key reordering ──────────────────
+#[test]
+fn command_id_is_canonical_across_key_order() {
+    use legion_types::command::RemoteCommand;
+
+    let a = RemoteCommand::new(
+        CommandSource::Telegram,
+        "u1",
+        "ryanx",
+        serde_json::json!({ "action": "x", "target": "agent_1", "extra": 42 }),
+        RiskClass::ReadOnly,
+    );
+    let b = RemoteCommand::new(
+        CommandSource::Telegram,
+        "u1",
+        "ryanx",
+        serde_json::json!({ "extra": 42, "target": "agent_1", "action": "x" }),
+        RiskClass::ReadOnly,
+    );
+    assert_eq!(
+        a.command_id, b.command_id,
+        "same logical intent must derive same command_id regardless of key order"
+    );
+}
+
 // ─── Lease / T1 single-writer invariant ───────────────────────────────────────
 #[test]
 fn telegram_poller_single_writer_lease() {

@@ -100,14 +100,15 @@ impl<'a> LeaseManager<'a> {
     /// Renew a lease, extending its expiry by another TTL.
     pub fn renew(&self, lease_id: Uuid, holder_id: &str) -> BusResult<()> {
         let lease_id_str = lease_id.to_string();
+        let active_str = serde_json::to_string(&LeaseStatus::Active)?;
         let now = Utc::now();
         let ttl: Option<i64> = self
             .db
             .conn
             .query_row(
                 "SELECT ttl_secs FROM authority_leases
-                  WHERE lease_id = ?1 AND holder_id = ?2 AND status = 'active'",
-                params![lease_id_str, holder_id],
+                  WHERE lease_id = ?1 AND holder_id = ?2 AND status = ?3",
+                params![lease_id_str, holder_id, active_str],
                 |row| row.get(0),
             )
             .optional()

@@ -58,6 +58,46 @@ pub struct RemoteCommand {
     pub review_id: Option<String>,
 }
 
+/// Produce a canonical JSON encoding with all object keys sorted lexicographically
+/// and minimal whitespace. Same logical intent from PWA/Telegram/MCP/Rust always
+/// hashes to the same `command_id` regardless of source map ordering.
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    let mut s = String::new();
+    write_canonical(value, &mut s);
+    s
+}
+
+fn write_canonical(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_default());
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_canonical(v, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                write_canonical(&map[*k], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 impl RemoteCommand {
     /// Derive a stable, deterministic command_id from its identity components.
     /// Collision resistance: SHA256 prefix of 24 hex chars = 96 bits.
@@ -82,7 +122,7 @@ impl RemoteCommand {
     ) -> Self {
         let source_event_id = source_event_id.into();
         let actor_id = actor_id.into();
-        let canonical_intent = serde_json::to_string(&intent).unwrap_or_default();
+        let canonical_intent = canonical_json(&intent);
         let command_id = Self::derive_id(&source, &source_event_id, &actor_id, &canonical_intent);
         let now = Utc::now();
         Self {
