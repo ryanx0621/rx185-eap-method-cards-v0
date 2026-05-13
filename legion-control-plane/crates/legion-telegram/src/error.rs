@@ -16,6 +16,10 @@ pub enum TgError {
     #[error("Telegram Not Found (404): bot not found")]
     NotFound,
 
+    /// 409 — T3: webhook/polling conflict; run() must call deleteWebhook and retry.
+    #[error("Telegram Conflict (409): webhook and polling are active simultaneously")]
+    Conflict,
+
     #[error("Network error: {0}")]
     Network(String),
 

@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS task_orders (
 );
 
 -- ─── Remote Commands ──────────────────────────────────────────────────────
--- command_id has a UNIQUE constraint — this is the exactly-once gate.
+-- command_id has a UNIQUE constraint -- this is the exactly-once gate.
 -- Any duplicate insert raises SQLITE_CONSTRAINT_UNIQUE.
 CREATE TABLE IF NOT EXISTS remote_commands (
     command_id        TEXT PRIMARY KEY,
@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS telegram_outbox (
     status            TEXT NOT NULL DEFAULT 'pending',   -- pending|sent|dead_letter
     retry_count       INTEGER NOT NULL DEFAULT 0,
     not_before        TEXT,                -- honor 429 retry_after
+    claim_id          TEXT,                -- UUID set by the worker that claimed this row; NULL = unclaimed
+    claimed_at        TEXT,                -- RFC3339 UTC; stale claims (> 60 s) are released automatically
     created_at        TEXT NOT NULL,
     sent_at           TEXT,
     dead_lettered_at  TEXT,

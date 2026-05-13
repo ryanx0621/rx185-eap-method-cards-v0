@@ -1,8 +1,8 @@
-/// Telegram long-poll loop implementing spec T1–T8.
+/// Telegram long-poll loop implementing spec T1-T8.
 ///
 /// T1  Single-writer lease (TTL 15 s, refresh every 5 s).
 /// T2  Offset written to DB before batch is considered consumed.
-/// T3  On boot: getWebhookInfo → deleteWebhook if a URL is set.
+/// T3  On boot: getWebhookInfo -> deleteWebhook if a URL is set.
 /// T4  getUpdates timeout=25, HTTP read timeout=35 s (set on ReqwestClient).
 /// T5  Backoff ladder [1,2,4,8,16,32]s; skip 401/404; honour 429 retry_after.
 /// T6  update_id uniqueness via INSERT OR IGNORE into telegram_updates.
@@ -23,7 +23,7 @@ use crate::offset::{load_offset, record_update, save_offset};
 use crate::outbox::OutboxManager;
 use crate::types::Update;
 
-// ─── Configuration ─────────────────────────────────────────────────────────
+// --- Configuration ----------------------------------------------------------
 
 pub struct PollerConfig {
     pub bot_id: String,
@@ -52,7 +52,7 @@ impl Default for PollerConfig {
     }
 }
 
-// ─── Poller ─────────────────────────────────────────────────────────────────
+// --- Poller -----------------------------------------------------------------
 
 pub struct Poller<A: TelegramApi> {
     api: Arc<A>,
@@ -87,12 +87,12 @@ impl<A: TelegramApi> Poller<A> {
         };
         tracing::info!(bot_id = %self.config.bot_id, %lease_id, "poller lease acquired");
 
-        // T3: reconcile webhook — if one is set, delete it so polling works cleanly.
+        // T3: reconcile webhook -- if one is set, delete it so polling works cleanly.
         let info = self.api.get_webhook_info().await?;
         if !info.url.is_empty() {
             tracing::warn!(
                 url = %info.url,
-                "active webhook found — deleting before polling (T3)"
+                "active webhook found -- deleting before polling (T3)"
             );
             self.api.delete_webhook().await?;
         }
@@ -104,9 +104,12 @@ impl<A: TelegramApi> Poller<A> {
     ///
     /// - Reads offset from DB (T2).
     /// - Calls getUpdates with T4 timeout.
-    /// - Deduplicates via INSERT OR IGNORE (T6).
-    /// - Saves new offset before processing (T2).
-    /// - Returns the number of NEW (non-duplicate) updates processed.
+    /// - Records ALL updates to `telegram_updates` durably (T2+T6).
+    /// - Dispatches new updates.
+    /// - Advances offset only AFTER durable ingest (T2).
+    ///
+    /// Crash safety: if we crash between record and save_offset, Telegram
+    /// resends the same batch; INSERT OR IGNORE (T6) deduplicates on replay.
     pub async fn poll_once(&self) -> TgResult<usize> {
         let offset = load_offset(&self.db, &self.config.bot_id)?;
         let updates = self
@@ -119,15 +122,19 @@ impl<A: TelegramApi> Poller<A> {
         }
 
         let max_id = updates.iter().map(|u| u.update_id).max().unwrap_or(offset);
-        // T2: persist offset BEFORE acknowledging (next call with offset = max_id + 1
-        //     tells Telegram we've consumed up to max_id).
-        save_offset(&self.db, &self.config.bot_id, max_id + 1)?;
 
-        let mut new_count = 0usize;
+        // T2: durably ingest ALL updates into telegram_updates BEFORE advancing offset.
+        // On crash here, Telegram resends the batch; T6 INSERT OR IGNORE deduplicates.
+        let mut ingested: Vec<(&Update, bool)> = Vec::with_capacity(updates.len());
         for update in &updates {
             let raw = serde_json::to_string(update).unwrap_or_default();
             let is_new = record_update(&self.db, update.update_id, &raw)?;
-            if is_new {
+            ingested.push((update, is_new));
+        }
+
+        let mut new_count = 0usize;
+        for (update, is_new) in &ingested {
+            if *is_new {
                 new_count += 1;
                 self.dispatch(update).await;
             } else {
@@ -135,10 +142,13 @@ impl<A: TelegramApi> Poller<A> {
             }
         }
 
+        // T2: offset advances only AFTER durable ingest is complete.
+        save_offset(&self.db, &self.config.bot_id, max_id + 1)?;
+
         Ok(new_count)
     }
 
-    /// Main polling loop — runs until a hard error (401/404/LeaseLost) or task cancel.
+    /// Main polling loop -- runs until a hard error (401/404/LeaseLost) or task cancel.
     pub async fn run(&self, lease_id: Uuid) -> TgResult<()> {
         let mut consecutive_errors: u32 = 0;
         let mut last_health = Instant::now();
@@ -166,7 +176,7 @@ impl<A: TelegramApi> Poller<A> {
                 match renewed {
                     Ok(_) => last_lease_refresh = Instant::now(),
                     Err(e) => {
-                        tracing::error!(?e, "lease renewal failed — stopping poller (T1)");
+                        tracing::error!(?e, "lease renewal failed -- stopping poller (T1)");
                         return Err(TgError::LeaseLost);
                     }
                 }
@@ -179,10 +189,19 @@ impl<A: TelegramApi> Poller<A> {
                 }
                 // T5: never retry these.
                 Err(TgError::Unauthorized) | Err(TgError::NotFound) => {
-                    tracing::error!("fatal Telegram auth error — stopping poller");
+                    tracing::error!("fatal Telegram auth error -- stopping poller");
                     return Err(TgError::Unauthorized);
                 }
                 Err(TgError::LeaseLost) => return Err(TgError::LeaseLost),
+                // T3: 409 means a webhook is active alongside polling; delete it and continue.
+                Err(TgError::Conflict) => {
+                    tracing::warn!("409 Conflict detected -- deleting webhook to restore polling (T3)");
+                    consecutive_errors = 0;
+                    if let Err(e) = self.api.delete_webhook().await {
+                        tracing::error!(?e, "deleteWebhook reconcile failed after 409 -- stopping poller");
+                        return Err(TgError::Conflict);
+                    }
+                }
                 // T5: honour 429 retry_after.
                 Err(TgError::RateLimited { retry_after_secs }) => {
                     tracing::warn!(retry_after_secs, "rate limited (429), backing off (T5)");
@@ -195,7 +214,7 @@ impl<A: TelegramApi> Poller<A> {
                         tracing::error!(
                             ?e,
                             consecutive_errors,
-                            "max retries exceeded — stopping poller"
+                            "max retries exceeded -- stopping poller"
                         );
                         return Err(e);
                     }
@@ -223,7 +242,7 @@ impl<A: TelegramApi> Poller<A> {
         );
         // If a webhook mysteriously appeared (T3 invariant), delete it.
         if !wh.url.is_empty() {
-            tracing::warn!("webhook appeared during poll — deleting (T3)");
+            tracing::warn!("webhook appeared during poll -- deleting (T3)");
             self.api.delete_webhook().await?;
         }
         Ok(())
@@ -247,7 +266,7 @@ impl<A: TelegramApi> Poller<A> {
     }
 }
 
-// ─── T5 backoff ladder ────────────────────────────────────────────────────────
+// --- T5 backoff ladder -------------------------------------------------------
 
 /// Returns backoff seconds for the n-th consecutive error: [1,2,4,8,16,32].
 pub fn backoff_secs(attempt: u32) -> u64 {

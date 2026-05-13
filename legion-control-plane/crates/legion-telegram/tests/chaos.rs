@@ -1,14 +1,17 @@
 /// Chaos tests for the Legion Telegram gateway (Phase 2).
 ///
-/// Each test uses FakeTelegramApi — no network I/O.
+/// Each test uses FakeTelegramApi -- no network I/O.
 ///
 /// Scenarios:
-///   C1 — T1: second poller is blocked by lease (single-writer invariant)
-///   C2 — T3: webhook present on boot → delete_webhook called
-///   C3 — T5: 429 rate-limit → retry_after stored as not_before in outbox
-///   C4 — T6: duplicate update_id → processed only once
-///   C5 — T2: offset persisted → new poller resumes from saved offset
-///   C6 — /status /agents /tasks return non-empty text without panicking
+///   C1 -- T1: second poller is blocked by lease (single-writer invariant)
+///   C2 -- T3: webhook present on boot -> delete_webhook called
+///   C3 -- T5: 429 rate-limit -> retry_after stored as not_before in outbox
+///   C4 -- T6: duplicate update_id -> processed only once
+///   C5 -- T2: offset persisted -> new poller resumes from saved offset
+///   C6 -- /status /agents /tasks return non-empty text without panicking
+///   C7 -- T2: durable ingest before offset advance (crash-replay safety)
+///   C8 -- T3: 409 Conflict -> deleteWebhook called in run() loop
+///   C9 -- T7: outbox row claim prevents double-send
 
 mod common;
 
@@ -22,7 +25,7 @@ use legion_telegram::{
     offset::load_offset,
 };
 
-// ─── C1: T1 single-writer lease ──────────────────────────────────────────────────────
+// --- C1: T1 single-writer lease ---------------------------------------------
 
 #[tokio::test]
 async fn c1_second_poller_rejected_by_lease() {
@@ -49,7 +52,7 @@ async fn c1_second_poller_rejected_by_lease() {
     );
 }
 
-// ─── C2: T3 webhook reconcile on boot ─────────────────────────────────────────────────
+// --- C2: T3 webhook reconcile on boot ---------------------------------------
 
 #[tokio::test]
 async fn c2_webhook_deleted_on_boot() {
@@ -73,15 +76,15 @@ async fn c2_webhook_deleted_on_boot() {
     );
 }
 
-// ─── C3: T5 429 → not_before stored in outbox ─────────────────────────────────────────
+// --- C3: T5 429 -> not_before stored in outbox ------------------------------
 
 #[tokio::test]
 async fn c3_rate_limited_outbox_message_gets_not_before() {
     let db = fresh_db();
     let api = FakeTelegramApi::new();
 
-    // First send attempt → 429 with retry_after=2.
-    // Second send attempt → success.
+    // First send attempt -> 429 with retry_after=2.
+    // Second send attempt -> success.
     // We test via OutboxManager directly (no need for full poll loop).
     let outbox = OutboxManager::new(Arc::clone(&db));
     outbox.enqueue(100, "hello".into());
@@ -118,7 +121,7 @@ async fn c3_rate_limited_outbox_message_gets_not_before() {
 
     let rl_api = Arc::new(RateLimitedApi { calls: std::sync::Mutex::new(0) });
 
-    // First flush → 429 → message stays pending, not_before set.
+    // First flush -> 429 -> message stays pending, not_before set.
     outbox.flush_once(rl_api.as_ref()).await;
     assert_eq!(outbox.sent_count(), 0, "message not sent after 429");
 
@@ -139,7 +142,7 @@ async fn c3_rate_limited_outbox_message_gets_not_before() {
     );
 }
 
-// ─── C4: T6 duplicate update_id → idempotent ───────────────────────────────────────────────
+// --- C4: T6 duplicate update_id -> idempotent --------------------------------
 
 #[tokio::test]
 async fn c4_duplicate_update_id_processed_once() {
@@ -174,7 +177,7 @@ async fn c4_duplicate_update_id_processed_once() {
     assert_eq!(stored, 1, "exactly one telegram_updates row");
 }
 
-// ─── C5: T2 offset persistence — new poller resumes from saved offset ─────────
+// --- C5: T2 offset persistence -- new poller resumes from saved offset --------
 
 #[tokio::test]
 async fn c5_offset_persisted_across_poller_restarts() {
@@ -234,7 +237,137 @@ async fn c5_offset_persisted_across_poller_restarts() {
     assert_eq!(offset2, 52, "restart must resume from persisted offset (T2)");
 }
 
-// ─── C6: read-only command handlers return non-empty strings ──────────────
+// --- C7: T2 durable ingest before offset advance ----------------------------
+//
+// After poll_once() completes, all updates must exist in telegram_updates
+// BEFORE the offset is advanced. Simulating a crash by manually resetting
+// the offset to its previous value should result in zero double-dispatches
+// (T6 INSERT OR IGNORE deduplicates the replay).
+
+#[tokio::test]
+async fn c7_t2_durable_ingest_before_offset_advance() {
+    let db = fresh_db();
+    let api = FakeTelegramApi::new();
+
+    api.push(FakeResponse::Updates(vec![
+        text_update(200, 1, "/agents"),
+        text_update(201, 1, "/agents"),
+    ]));
+    // On "restart", Telegram resends the same batch (offset not acknowledged).
+    api.push(FakeResponse::Updates(vec![
+        text_update(200, 1, "/agents"),
+        text_update(201, 1, "/agents"),
+    ]));
+
+    let outbox = OutboxManager::new(Arc::clone(&db));
+    let cfg = PollerConfig { bot_id: "bot1".into(), ..Default::default() };
+    let poller = Poller::new(Arc::clone(&api), Arc::clone(&db), Arc::clone(&outbox), cfg);
+
+    poller.boot().await.expect("boot");
+
+    let n = poller.poll_once().await.expect("first poll");
+    assert_eq!(n, 2, "2 new updates processed");
+
+    let offset = load_offset(&db, "bot1").expect("offset");
+    assert_eq!(offset, 202, "offset advanced to max_id+1");
+
+    let update_count: i64 = {
+        let db = db.lock().unwrap();
+        db.conn.query_row("SELECT COUNT(*) FROM telegram_updates", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(update_count, 2, "2 rows durably stored in telegram_updates");
+
+    // Simulate crash: reset offset back to 200 (as if save_offset never completed).
+    {
+        let db = db.lock().unwrap();
+        db.conn
+            .execute(
+                "UPDATE telegram_offsets SET last_update_id = 200 WHERE bot_id = 'bot1'",
+                [],
+            )
+            .unwrap();
+    }
+
+    // Second poll with same batch: all updates already in DB -> zero new dispatches.
+    let n2 = poller.poll_once().await.expect("second poll after simulated crash");
+    assert_eq!(n2, 0, "0 new updates -- T6 dedup prevented any double-dispatch (T2 invariant)");
+
+    // Offset re-advances to 202.
+    let offset2 = load_offset(&db, "bot1").expect("offset2");
+    assert_eq!(offset2, 202, "offset correctly re-advanced to 202");
+}
+
+// --- C8: 409 Conflict -> TgError::Conflict + deleteWebhook in run() ---------
+
+#[tokio::test]
+async fn c8_conflict_409_triggers_webhook_reconcile_in_run() {
+    let db = fresh_db();
+    let api = FakeTelegramApi::new();
+
+    // Sequence: 409 Conflict (triggers reconcile) -> 401 Unauthorized (stops loop).
+    api.push(FakeResponse::Conflict);
+    api.push(FakeResponse::Unauthorized);
+
+    let outbox = OutboxManager::new(Arc::clone(&db));
+    let cfg = PollerConfig { bot_id: "bot1".into(), max_retries: 1, ..Default::default() };
+    let poller = Poller::new(Arc::clone(&api), Arc::clone(&db), Arc::clone(&outbox), cfg);
+
+    let lease_id = poller.boot().await.expect("boot");
+    // boot() calls delete_webhook once if webhook is set; api has no webhook here -> 0 calls.
+    let deletes_before = *api.deleted_webhook_calls.lock().unwrap();
+
+    // run() should hit 409, call deleteWebhook (T3 reconcile), then stop on 401.
+    let err = poller.run(lease_id).await.expect_err("run must stop on Unauthorized");
+    assert!(
+        matches!(err, TgError::Unauthorized),
+        "run loop stopped by Unauthorized, got: {err:?}"
+    );
+
+    let deletes_after = *api.deleted_webhook_calls.lock().unwrap();
+    assert_eq!(
+        deletes_after - deletes_before,
+        1,
+        "deleteWebhook called exactly once for 409 Conflict reconcile (T3)"
+    );
+}
+
+// --- C9: Outbox row claim prevents double-send across two flush calls --------
+//
+// The atomic claim (UPDATE ... WHERE claim_id IS NULL) means a second flush
+// that races the first one will claim no rows and send nothing.
+// We verify the invariant sequentially: first flush claims+sends all rows;
+// second flush finds the rows already claimed/sent and does nothing.
+
+#[tokio::test]
+async fn c9_outbox_claim_prevents_double_send() {
+    let db = fresh_db();
+    let outbox = OutboxManager::new(Arc::clone(&db));
+
+    outbox.enqueue(42, "msg1".into());
+    outbox.enqueue(42, "msg2".into());
+    outbox.enqueue(99, "msg3".into());
+
+    assert_eq!(outbox.pending_count(), 3, "3 messages pending");
+
+    let api = FakeTelegramApi::new();
+
+    // First flush: claims all 3 unclaimed rows and sends them.
+    let sent1 = outbox.flush_once(&*api).await;
+    assert_eq!(sent1, 3, "first flush sends all 3 messages");
+
+    // Second flush: rows now have claim_id set (or are already 'sent');
+    // the atomic claim selects zero rows -> nothing is re-sent.
+    let sent2 = outbox.flush_once(&*api).await;
+    assert_eq!(sent2, 0, "second flush sends nothing -- claim mechanism prevents double-send");
+
+    assert_eq!(outbox.sent_count(), 3, "3 rows in 'sent' state");
+    assert_eq!(outbox.pending_count(), 0, "no messages still pending");
+
+    let api_calls = api.sent_messages.lock().unwrap().len();
+    assert_eq!(api_calls, 3, "exactly 3 send_message API calls -- no double-send");
+}
+
+// --- C6: read-only command handlers return non-empty strings ----------------
 
 #[test]
 fn c6_read_only_commands_return_text() {

@@ -83,6 +83,9 @@ mod real {
             if status == 404 {
                 return Err(TgError::NotFound);
             }
+            if status.as_u16() == 409 {
+                return Err(TgError::Conflict);
+            }
             if status.as_u16() == 429 {
                 let retry_after = resp
                     .json::<serde_json::Value>()

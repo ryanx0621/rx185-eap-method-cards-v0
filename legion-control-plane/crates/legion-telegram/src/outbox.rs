@@ -1,8 +1,8 @@
 /// T7: Rate-limited Telegram outbox.
 ///
 /// Rules:
-///   - Per-chat: ≤ 1 message/s (enforced via `not_before` column).
-///   - Global:   ≤ 25 messages/s (40 ms sleep between sends).
+///   - Per-chat: <= 1 message/s (enforced via `not_before` column).
+///   - Global:   <= 25 messages/s (40 ms sleep between sends).
 ///   - Retry on transient errors; dead-letter after 5 failures.
 ///   - SKIP LOCKED semantics emulated via row status + rowid ordering.
 
@@ -12,12 +12,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::params;
+use uuid::Uuid;
 
 use legion_bus::BusDb;
 use crate::api::TelegramApi;
 
 const MAX_RETRY: u32 = 5;
-const GLOBAL_INTERVAL_MS: u64 = 40; // 1000 / 25 = 40 ms → 25 msg/s global cap
+const GLOBAL_INTERVAL_MS: u64 = 40; // 1000 / 25 = 40 ms -> 25 msg/s global cap
 const PER_CHAT_INTERVAL_MS: i64 = 1000; // 1 msg/s per chat
 
 pub struct OutboxManager {
@@ -117,23 +118,47 @@ impl OutboxManager {
         sent
     }
 
-    // ─── Private DB helpers ──────────────────────────────────────────────────────
+    // --- Private DB helpers -------------------------------------------------
 
     fn pending_rows(&self) -> Vec<(i64, i64, String, u32)> {
         let db = self.db.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        // Claims older than 60 s belong to workers that died; release them.
+        let stale_cutoff = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        let claim_id = Uuid::new_v4().to_string();
+
+        let _ = db.conn.execute(
+            "UPDATE telegram_outbox SET claim_id = NULL, claimed_at = NULL
+              WHERE status = 'pending' AND claimed_at IS NOT NULL AND claimed_at < ?1",
+            params![stale_cutoff],
+        );
+
+        // Atomically claim up to 50 eligible rows with this worker's unique claim_id.
+        // Two concurrent workers get different UUIDs so their SELECT results never overlap.
+        let _ = db.conn.execute(
+            "UPDATE telegram_outbox SET claim_id = ?1, claimed_at = ?2
+              WHERE id IN (
+                  SELECT id FROM telegram_outbox
+                   WHERE status = 'pending'
+                     AND claim_id IS NULL
+                     AND (not_before IS NULL OR not_before <= ?2)
+                   ORDER BY chat_id, message_seq
+                   LIMIT 50
+              )",
+            params![claim_id, now_str],
+        );
+
         let mut stmt = db
             .conn
             .prepare(
                 "SELECT id, chat_id, payload, retry_count
                    FROM telegram_outbox
-                  WHERE status = 'pending'
-                    AND (not_before IS NULL OR not_before <= ?1)
-                  ORDER BY chat_id, message_seq
-                  LIMIT 50",
+                  WHERE status = 'pending' AND claim_id = ?1
+                  ORDER BY chat_id, message_seq",
             )
             .unwrap();
-        stmt.query_map(params![now], |r| {
+        stmt.query_map(params![claim_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .unwrap()

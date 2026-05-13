@@ -10,7 +10,7 @@ use legion_telegram::{
     types::{BotInfo, Message, Chat, SentMessage, Update, User, WebhookInfo},
 };
 
-// ─── Canned responses ───────────────────────────────────────────────────────────
+// --- Canned responses -------------------------------------------------------
 
 /// A pre-programmed response for `get_updates`.
 #[derive(Clone)]
@@ -23,9 +23,11 @@ pub enum FakeResponse {
     NetworkError,
     /// Simulate 401 (fatal).
     Unauthorized,
+    /// Simulate 409 Conflict (webhook + polling active simultaneously).
+    Conflict,
 }
 
-// ─── FakeTelegramApi ─────────────────────────────────────────────────────────
+// --- FakeTelegramApi --------------------------------------------------------
 
 pub struct FakeTelegramApi {
     /// Queue of responses to return from `get_updates`, drained in order.
@@ -92,7 +94,8 @@ impl TelegramApi for FakeTelegramApi {
                 Err(TgError::Network("simulated network failure".into()))
             }
             Some(FakeResponse::Unauthorized) => Err(TgError::Unauthorized),
-            None => Ok(vec![]), // empty batch — simulates long-poll timeout
+            Some(FakeResponse::Conflict) => Err(TgError::Conflict),
+            None => Ok(vec![]), // empty batch -- simulates long-poll timeout
         }
     }
 
@@ -115,7 +118,7 @@ impl TelegramApi for FakeTelegramApi {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
 
 pub fn fresh_db() -> Arc<Mutex<BusDb>> {
     Arc::new(Mutex::new(BusDb::open_in_memory().expect("in-memory db")))
