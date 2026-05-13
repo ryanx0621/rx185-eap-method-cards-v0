@@ -1,17 +1,20 @@
-/// Chaos tests for the Legion Telegram gateway (Phase 2).
+/// Chaos tests for the Legion Telegram gateway (Phase 2 / 2.1 / 2.2).
 ///
 /// Each test uses FakeTelegramApi -- no network I/O.
 ///
 /// Scenarios:
-///   C1 -- T1: second poller is blocked by lease (single-writer invariant)
-///   C2 -- T3: webhook present on boot -> delete_webhook called
-///   C3 -- T5: 429 rate-limit -> retry_after stored as not_before in outbox
-///   C4 -- T6: duplicate update_id -> processed only once
-///   C5 -- T2: offset persisted -> new poller resumes from saved offset
-///   C6 -- /status /agents /tasks return non-empty text without panicking
-///   C7 -- T2: durable ingest before offset advance (crash-replay safety)
-///   C8 -- T3: 409 Conflict -> deleteWebhook called in run() loop
-///   C9 -- T7: outbox row claim prevents double-send
+///   C1  -- T1:   second poller is blocked by lease (single-writer invariant)
+///   C2  -- T3:   webhook present on boot -> delete_webhook called
+///   C3  -- T5:   429 rate-limit -> retry_after stored as not_before in outbox
+///   C4  -- T6:   duplicate update_id -> ingested only once
+///   C5  -- T2:   offset persisted -> new poller resumes from saved offset
+///   C6  --       /status /agents /tasks return non-empty text without panicking
+///   C7  -- T2:   durable ingest before offset advance (replay-safe ingest)
+///   C8  -- T3:   409 Conflict -> deleteWebhook called in run() loop
+///   C9  -- T7:   outbox row claim prevents double-send
+///   C10 -- T2.2: dispatch_pending recovers rows stranded after crash-before-dispatch
+///   C11 -- T2.2: outbox enqueue + status update is atomic; partial-tx rollback
+///                keeps the row recoverable, retry dispatches exactly once
 
 mod common;
 
@@ -239,10 +242,11 @@ async fn c5_offset_persisted_across_poller_restarts() {
 
 // --- C7: T2 durable ingest before offset advance ----------------------------
 //
-// After poll_once() completes, all updates must exist in telegram_updates
-// BEFORE the offset is advanced. Simulating a crash by manually resetting
-// the offset to its previous value should result in zero double-dispatches
-// (T6 INSERT OR IGNORE deduplicates the replay).
+// poll_once() is ingest-only (Phase 2.2). It writes rows as 'pending_dispatch'
+// and advances the offset only AFTER every row is durable. A simulated crash
+// that resets the offset must replay the same batch with zero new ingest
+// (T6 INSERT OR IGNORE) and zero dispatched state changes. Dispatch recovery
+// is exercised separately in C10.
 
 #[tokio::test]
 async fn c7_t2_durable_ingest_before_offset_advance() {
@@ -266,16 +270,27 @@ async fn c7_t2_durable_ingest_before_offset_advance() {
     poller.boot().await.expect("boot");
 
     let n = poller.poll_once().await.expect("first poll");
-    assert_eq!(n, 2, "2 new updates processed");
+    assert_eq!(n, 2, "2 new updates ingested");
 
     let offset = load_offset(&db, "bot1").expect("offset");
-    assert_eq!(offset, 202, "offset advanced to max_id+1");
+    assert_eq!(offset, 202, "offset advanced to max_id+1 only after every row was durable");
 
-    let update_count: i64 = {
+    // Both rows are durably stored as 'pending_dispatch'.
+    let (count, pending): (i64, i64) = {
         let db = db.lock().unwrap();
-        db.conn.query_row("SELECT COUNT(*) FROM telegram_updates", [], |r| r.get(0)).unwrap()
+        let c: i64 = db.conn.query_row("SELECT COUNT(*) FROM telegram_updates", [], |r| r.get(0)).unwrap();
+        let p: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_updates WHERE status='pending_dispatch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (c, p)
     };
-    assert_eq!(update_count, 2, "2 rows durably stored in telegram_updates");
+    assert_eq!(count, 2, "2 rows durably stored in telegram_updates");
+    assert_eq!(pending, 2, "both rows are pending_dispatch (dispatch not run by poll_once)");
 
     // Simulate crash: reset offset back to 200 (as if save_offset never completed).
     {
@@ -288,13 +303,25 @@ async fn c7_t2_durable_ingest_before_offset_advance() {
             .unwrap();
     }
 
-    // Second poll with same batch: all updates already in DB -> zero new dispatches.
+    // Second poll with same batch: all updates already in DB -> zero new ingest.
     let n2 = poller.poll_once().await.expect("second poll after simulated crash");
-    assert_eq!(n2, 0, "0 new updates -- T6 dedup prevented any double-dispatch (T2 invariant)");
+    assert_eq!(n2, 0, "0 new ingests -- T6 deduplicated the replay");
 
-    // Offset re-advances to 202.
+    // Offset re-advances to 202; rows still pending_dispatch, none lost.
     let offset2 = load_offset(&db, "bot1").expect("offset2");
     assert_eq!(offset2, 202, "offset correctly re-advanced to 202");
+
+    let still_pending: i64 = {
+        let db = db.lock().unwrap();
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_updates WHERE status='pending_dispatch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(still_pending, 2, "both rows remain pending_dispatch; dispatch will pick them up");
 }
 
 // --- C8: 409 Conflict -> TgError::Conflict + deleteWebhook in run() ---------
@@ -365,6 +392,161 @@ async fn c9_outbox_claim_prevents_double_send() {
 
     let api_calls = api.sent_messages.lock().unwrap().len();
     assert_eq!(api_calls, 3, "exactly 3 send_message API calls -- no double-send");
+}
+
+// --- C10: dispatch_pending recovers rows stranded by a crash-before-dispatch ---
+//
+// This is the bug that the Phase 2.1 fix missed: record_update succeeds,
+// then the process dies BEFORE dispatch runs. The row is durably present
+// as 'pending_dispatch' but no outbox row exists. On restart, Telegram
+// replays the same update; INSERT OR IGNORE returns is_new=false; the old
+// design's poll_once branched into the duplicate arm and never dispatched.
+//
+// Under the Phase 2.2 design, dispatch is decoupled: a separate
+// dispatch_pending() scans the DB for pending_dispatch rows and processes
+// them. This test simulates the crash scenario by pre-inserting a row
+// directly, then verifies dispatch_pending picks it up exactly once.
+
+#[tokio::test]
+async fn c10_dispatch_pending_recovers_stranded_row() {
+    let db = fresh_db();
+    let outbox = OutboxManager::new(Arc::clone(&db));
+    let api = FakeTelegramApi::new();
+    let cfg = PollerConfig { bot_id: "bot1".into(), ..Default::default() };
+    let poller = Poller::new(Arc::clone(&api), Arc::clone(&db), Arc::clone(&outbox), cfg);
+
+    // Simulate crash after record_update, before dispatch:
+    // a row exists with status='pending_dispatch' but no outbox row.
+    let raw = serde_json::to_string(&text_update(300, 1, "/status")).unwrap();
+    {
+        let db = db.lock().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO telegram_updates (update_id, raw_json, received_at, status)
+                 VALUES (?1, ?2, ?3, 'pending_dispatch')",
+                rusqlite::params![300i64, raw, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(outbox.pending_count(), 0, "no outbox row exists before dispatch_pending");
+
+    // dispatch_pending must pick the row up and dispatch it exactly once.
+    let n = poller.dispatch_pending().expect("dispatch");
+    assert_eq!(n, 1, "exactly one row dispatched from recovered pending_dispatch state");
+    assert_eq!(outbox.pending_count(), 1, "one outbox row enqueued");
+
+    // Row transitioned to 'dispatched' with a timestamp.
+    let (status, dispatched_at): (String, Option<String>) = {
+        let db = db.lock().unwrap();
+        db.conn
+            .query_row(
+                "SELECT status, dispatched_at FROM telegram_updates WHERE update_id=300",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(status, "dispatched", "row reached terminal state");
+    assert!(dispatched_at.is_some(), "dispatched_at timestamp populated");
+
+    // Second call: idempotent (no double-enqueue).
+    let n2 = poller.dispatch_pending().expect("second");
+    assert_eq!(n2, 0, "second call finds no pending rows -- exactly-once");
+    assert_eq!(outbox.pending_count(), 1, "still exactly one outbox row");
+}
+
+// --- C11: outbox enqueue + status update is a single transaction ------------
+//
+// The reviewer-mandated contract: if the outbox INSERT succeeds inside the
+// dispatch transaction but the status UPDATE fails (or the process dies
+// between them), the entire transaction must roll back. The row stays
+// 'pending_dispatch', the outbox stays empty, and the next dispatch_pending
+// retries exactly once -- no duplicate terminal state, no orphan outbox row.
+//
+// We simulate the partial-tx failure by manually running BEGIN + INSERT
+// outbox + drop-without-commit. This is the same rollback path that
+// dispatch_pending's tx would take on any internal error.
+
+#[tokio::test]
+async fn c11_partial_tx_rollback_keeps_row_recoverable() {
+    let db = fresh_db();
+    let outbox = OutboxManager::new(Arc::clone(&db));
+    let api = FakeTelegramApi::new();
+    let cfg = PollerConfig { bot_id: "bot1".into(), ..Default::default() };
+    let poller = Poller::new(Arc::clone(&api), Arc::clone(&db), Arc::clone(&outbox), cfg);
+
+    // Pre-insert a pending_dispatch row (simulating prior ingest).
+    let raw = serde_json::to_string(&text_update(400, 7, "/status")).unwrap();
+    {
+        let db = db.lock().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO telegram_updates (update_id, raw_json, received_at, status)
+                 VALUES (?1, ?2, ?3, 'pending_dispatch')",
+                rusqlite::params![400i64, raw, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    // Simulate "outbox enqueue succeeded, then forced failure before status update":
+    // run a partial transaction (BEGIN -> INSERT outbox -> drop without commit).
+    // This is exactly what would happen if dispatch_pending's tx hit an error
+    // after INSERT but before UPDATE: the auto-rollback unwinds both writes.
+    {
+        let db = db.lock().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO telegram_outbox
+                (chat_id, message_seq, payload, method, status, retry_count, created_at)
+             VALUES (?1, ?2, ?3, 'sendMessage', 'pending', 0, ?4)",
+            rusqlite::params![
+                7i64,
+                1i64,
+                serde_json::json!({ "text": "would-be response" }).to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        // Drop tx without commit -> rollback.
+        drop(tx);
+    }
+
+    // Post-rollback invariants: nothing leaked.
+    assert_eq!(outbox.pending_count(), 0, "rollback unwound the outbox INSERT");
+    let status: String = {
+        let db = db.lock().unwrap();
+        db.conn
+            .query_row(
+                "SELECT status FROM telegram_updates WHERE update_id=400",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(status, "pending_dispatch", "row remained pending after rollback");
+
+    // Retry: dispatch_pending must dispatch exactly once.
+    let n = poller.dispatch_pending().expect("retry");
+    assert_eq!(n, 1, "retry dispatched the recovered row");
+    assert_eq!(outbox.pending_count(), 1, "exactly one outbox row -- no duplicate from earlier rollback");
+
+    let final_status: String = {
+        let db = db.lock().unwrap();
+        db.conn
+            .query_row(
+                "SELECT status FROM telegram_updates WHERE update_id=400",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(final_status, "dispatched", "terminal state reached on retry");
+
+    // Third call must be a no-op.
+    let n2 = poller.dispatch_pending().expect("third");
+    assert_eq!(n2, 0, "third call finds nothing pending");
+    assert_eq!(outbox.pending_count(), 1, "still exactly one outbox row");
 }
 
 // --- C6: read-only command handlers return non-empty strings ----------------

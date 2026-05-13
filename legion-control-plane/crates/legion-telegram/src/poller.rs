@@ -1,17 +1,23 @@
-/// Telegram long-poll loop implementing spec T1-T8.
+/// Telegram long-poll loop implementing spec T1-T8 + dispatch state machine (T2.2).
 ///
-/// T1  Single-writer lease (TTL 15 s, refresh every 5 s).
-/// T2  Offset written to DB before batch is considered consumed.
-/// T3  On boot: getWebhookInfo -> deleteWebhook if a URL is set.
-/// T4  getUpdates timeout=25, HTTP read timeout=35 s (set on ReqwestClient).
-/// T5  Backoff ladder [1,2,4,8,16,32]s; skip 401/404; honour 429 retry_after.
-/// T6  update_id uniqueness via INSERT OR IGNORE into telegram_updates.
-/// T7  Outbox rate limiting (delegated to OutboxManager).
-/// T8  getMe + getWebhookInfo health probe every 30 s.
+/// T1   Single-writer lease (TTL 15 s, refresh every 5 s).
+/// T2   Offset written to DB only AFTER all rows are durably ingested.
+/// T2.2 Dispatch is decoupled from ingest. `poll_once` writes raw rows as
+///      `pending_dispatch`; `dispatch_pending` later moves them to
+///      `dispatched` atomically with the outbox enqueue (single SQLite tx).
+///      A crash between ingest and dispatch is recoverable on next tick.
+/// T3   On boot: getWebhookInfo -> deleteWebhook if a URL is set.
+/// T4   getUpdates timeout=25, HTTP read timeout=35 s (set on ReqwestClient).
+/// T5   Backoff ladder [1,2,4,8,16,32]s; skip 401/404; honour 429 retry_after.
+/// T6   update_id uniqueness via INSERT OR IGNORE into telegram_updates.
+/// T7   Outbox rate limiting (delegated to OutboxManager).
+/// T8   getMe + getWebhookInfo health probe every 30 s.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
+use rusqlite::params;
 use uuid::Uuid;
 
 use legion_bus::{BusDb, leases::LeaseManager};
@@ -100,16 +106,20 @@ impl<A: TelegramApi> Poller<A> {
         Ok(lease_id)
     }
 
-    /// Poll for one batch of updates.
+    /// Ingest one batch of updates (T2 + T6).
     ///
-    /// - Reads offset from DB (T2).
-    /// - Calls getUpdates with T4 timeout.
-    /// - Records ALL updates to `telegram_updates` durably (T2+T6).
-    /// - Dispatches new updates.
-    /// - Advances offset only AFTER durable ingest (T2).
+    /// Pure ingest path. Updates are recorded as `pending_dispatch`. Dispatch
+    /// is the job of `dispatch_pending`, called separately.
     ///
-    /// Crash safety: if we crash between record and save_offset, Telegram
-    /// resends the same batch; INSERT OR IGNORE (T6) deduplicates on replay.
+    /// Order (all crash-safe under SQLite WAL):
+    ///   1. load offset
+    ///   2. get_updates
+    ///   3. INSERT each row (status='pending_dispatch'); T6 deduplicates replays
+    ///   4. save offset = max_id + 1 (only after every row is durable)
+    ///
+    /// Crash between 3 and 4: Telegram resends the same batch, INSERT OR IGNORE
+    /// returns 0 changes for already-recorded rows. The rows remain
+    /// `pending_dispatch` and will be picked up by `dispatch_pending`.
     pub async fn poll_once(&self) -> TgResult<usize> {
         let offset = load_offset(&self.db, &self.config.bot_id)?;
         let updates = self
@@ -123,29 +133,127 @@ impl<A: TelegramApi> Poller<A> {
 
         let max_id = updates.iter().map(|u| u.update_id).max().unwrap_or(offset);
 
-        // T2: durably ingest ALL updates into telegram_updates BEFORE advancing offset.
-        // On crash here, Telegram resends the batch; T6 INSERT OR IGNORE deduplicates.
-        let mut ingested: Vec<(&Update, bool)> = Vec::with_capacity(updates.len());
+        let mut new_count = 0usize;
         for update in &updates {
             let raw = serde_json::to_string(update).unwrap_or_default();
             let is_new = record_update(&self.db, update.update_id, &raw)?;
-            ingested.push((update, is_new));
-        }
-
-        let mut new_count = 0usize;
-        for (update, is_new) in &ingested {
-            if *is_new {
+            if is_new {
                 new_count += 1;
-                self.dispatch(update).await;
             } else {
                 tracing::debug!(update_id = update.update_id, "duplicate update_id ignored (T6)");
             }
         }
 
-        // T2: offset advances only AFTER durable ingest is complete.
+        // T2: offset advances only AFTER every row is durably ingested.
         save_offset(&self.db, &self.config.bot_id, max_id + 1)?;
 
         Ok(new_count)
+    }
+
+    /// Drain `pending_dispatch` rows from `telegram_updates` (T2.2).
+    ///
+    /// Per-row contract — entirely DB-side, no Telegram API calls here:
+    ///   BEGIN
+    ///   3. INSERT outbox row (if message is a /command)
+    ///   4. UPDATE telegram_updates SET status='dispatched' WHERE status='pending_dispatch'
+    ///      - if rows_changed == 0, another worker (or earlier retry) already won; ROLLBACK
+    ///   5. COMMIT
+    ///
+    /// If anything between BEGIN and COMMIT fails, the tx auto-rollbacks on
+    /// drop — both writes are undone, the row stays `pending_dispatch`, and
+    /// the next call picks it up again. Exactly-once is guaranteed by the
+    /// WHERE status='pending_dispatch' guard inside step 4.
+    pub fn dispatch_pending(&self) -> TgResult<usize> {
+        // 1. Pull a batch of candidate rows.
+        let pending: Vec<(i64, String)> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.conn.prepare(
+                "SELECT update_id, raw_json FROM telegram_updates
+                  WHERE status = 'pending_dispatch'
+                  ORDER BY update_id
+                  LIMIT 50",
+            )?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .flatten()
+                .collect();
+            rows
+        };
+
+        let mut dispatched = 0usize;
+        for (update_id, raw_json) in pending {
+            // 2. Parse outside any transaction (pure CPU, no DB).
+            let update: Update = match serde_json::from_str(&raw_json) {
+                Ok(u) => u,
+                Err(e) => {
+                    self.mark_rejected(update_id, &format!("parse: {e}"))?;
+                    continue;
+                }
+            };
+
+            // Render the response under the lock (commands::handle is read-only).
+            let response = {
+                let db = self.db.lock().unwrap();
+                render_response(&update, &db)
+            };
+
+            // 3+4+5: atomic enqueue + status transition.
+            let db = self.db.lock().unwrap();
+            let tx = db.conn.unchecked_transaction()?;
+
+            // 3. Enqueue outbox row (only if there's a /command response).
+            if let Some((chat_id, text)) = response.as_ref() {
+                let seq: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(message_seq), 0) + 1 FROM telegram_outbox WHERE chat_id = ?1",
+                        params![chat_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(1);
+                let payload = serde_json::json!({ "text": text }).to_string();
+                tx.execute(
+                    "INSERT INTO telegram_outbox
+                        (chat_id, message_seq, payload, method, status, retry_count, created_at)
+                     VALUES (?1, ?2, ?3, 'sendMessage', 'pending', 0, ?4)",
+                    params![chat_id, seq, payload, Utc::now().to_rfc3339()],
+                )?;
+            }
+
+            // 4. Mark dispatched; the WHERE status='pending_dispatch' guard
+            //    is the exactly-once gate against a racing worker or a
+            //    retried previous tx that already committed.
+            let claimed = tx.execute(
+                "UPDATE telegram_updates
+                    SET status='dispatched', dispatched_at=?1
+                  WHERE update_id=?2 AND status='pending_dispatch'",
+                params![Utc::now().to_rfc3339(), update_id],
+            )?;
+
+            if claimed == 0 {
+                // Race lost (someone else won this row, or it was rejected).
+                // Drop the tx without committing -> rollback the outbox INSERT.
+                drop(tx);
+                tracing::debug!(update_id, "dispatch race lost; tx rolled back");
+                continue;
+            }
+
+            // 5. Commit.
+            tx.commit()?;
+            dispatched += 1;
+        }
+
+        Ok(dispatched)
+    }
+
+    fn mark_rejected(&self, update_id: i64, reason: &str) -> TgResult<()> {
+        let db = self.db.lock().unwrap();
+        db.conn.execute(
+            "UPDATE telegram_updates
+                SET status='rejected', dispatch_error=?1, dispatched_at=?2
+              WHERE update_id=?3 AND status='pending_dispatch'",
+            params![reason, Utc::now().to_rfc3339(), update_id],
+        )?;
+        Ok(())
     }
 
     /// Main polling loop -- runs until a hard error (401/404/LeaseLost) or task cancel.
@@ -186,6 +294,14 @@ impl<A: TelegramApi> Poller<A> {
                 Ok(n) => {
                     consecutive_errors = 0;
                     tracing::debug!(new_updates = n, "poll_once done");
+
+                    // T2.2: drain pending dispatches. Includes the rows we just
+                    // ingested AND any rows recovered from a prior crash.
+                    match self.dispatch_pending() {
+                        Ok(d) if d > 0 => tracing::debug!(dispatched = d, "dispatch_pending drained"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(?e, "dispatch_pending failed; rows remain recoverable"),
+                    }
                 }
                 // T5: never retry these.
                 Err(TgError::Unauthorized) | Err(TgError::NotFound) => {
@@ -248,22 +364,22 @@ impl<A: TelegramApi> Poller<A> {
         Ok(())
     }
 
-    /// Dispatch a single inbound update to the command handler.
-    async fn dispatch(&self, update: &Update) {
-        if let Some(msg) = &update.message {
-            if let Some(text) = &msg.text {
-                if text.starts_with('/') {
-                    let chat_id = msg.chat.id;
-                    let response = {
-                        let db = self.db.lock().unwrap();
-                        crate::commands::handle(text.trim(), &db)
-                    };
-                    self.outbox.enqueue(chat_id, response);
-                }
-            }
-        }
-        // callback_query dispatch reserved for Phase 2.5 (HMAC callback tokens).
+}
+
+/// Render the response text for an inbound update, if any.
+///
+/// Pure function over `&BusDb` (read-only commands). Returns `None` when the
+/// update is not a `/command` we can respond to — the row is still moved to
+/// `dispatched` (it was handled, just with no outbox write).
+///
+/// callback_query dispatch is reserved for Phase 2.5 (HMAC callback tokens).
+fn render_response(update: &Update, db: &BusDb) -> Option<(i64, String)> {
+    let msg = update.message.as_ref()?;
+    let text = msg.text.as_ref()?;
+    if !text.starts_with('/') {
+        return None;
     }
+    Some((msg.chat.id, crate::commands::handle(text.trim(), db)))
 }
 
 // --- T5 backoff ladder -------------------------------------------------------

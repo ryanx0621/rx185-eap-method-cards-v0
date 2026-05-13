@@ -61,12 +61,17 @@ pub fn save_offset(db: &Arc<Mutex<BusDb>>, bot_id: &str, offset: i64) -> TgResul
     OffsetStore::new(&db, bot_id).save(offset)
 }
 
-// ─── Idempotency store for update_id (T6) ───────────────────────────────────
+// ─── Idempotency store for update_id (T6) ─────────────────────────────────
 
 /// Returns `true` if this update_id is NEW (not yet seen).
 ///
-/// Inserts into `telegram_updates` on first sight; ignores UNIQUE conflict
-/// on duplicates (T6 idempotency).
+/// Inserts into `telegram_updates` with status='pending_dispatch' on first
+/// sight; ignores UNIQUE conflict on duplicates (T6 idempotency).
+///
+/// After return, the row is durable; dispatch is the dispatcher's
+/// responsibility (see `Poller::dispatch_pending`). This decoupling
+/// guarantees that a crash between record and dispatch cannot strand the
+/// update — replay finds the row already `pending_dispatch` and dispatches it.
 pub fn record_update(
     db: &Arc<Mutex<BusDb>>,
     update_id: i64,
@@ -76,7 +81,7 @@ pub fn record_update(
     let now = Utc::now().to_rfc3339();
     let changed = db.conn.execute(
         "INSERT OR IGNORE INTO telegram_updates (update_id, raw_json, received_at, status)
-         VALUES (?1, ?2, ?3, 'received')",
+         VALUES (?1, ?2, ?3, 'pending_dispatch')",
         params![update_id, raw_json, now],
     )?;
     Ok(changed > 0)

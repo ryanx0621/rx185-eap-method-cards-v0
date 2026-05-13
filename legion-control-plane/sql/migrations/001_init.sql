@@ -110,12 +110,23 @@ CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
     ON heartbeats(agent_id, received_at DESC);
 
 -- ─── Telegram Updates ─────────────────────────────────────────────────────
+-- Status state machine (Phase 2.2):
+--   received          - legacy default (pre-2.2); migrated to pending_dispatch by 002
+--   pending_dispatch  - row durably ingested, dispatch owed
+--   dispatched        - outbox row enqueued (atomic with status update)
+--   done              - reserved for outbox-send confirmation (later phase)
+--   rejected          - parse failed or filtered; will not be retried
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id         INTEGER PRIMARY KEY,  -- Telegram's own monotonic update_id
     raw_json          TEXT NOT NULL,
     received_at       TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'received'  -- received|parsed|deduplicated|rejected
+    status            TEXT NOT NULL DEFAULT 'pending_dispatch',
+    dispatched_at     TEXT,                 -- set when transitioning to dispatched/rejected
+    dispatch_error    TEXT                  -- populated when status='rejected'
 );
+CREATE INDEX IF NOT EXISTS idx_telegram_updates_pending
+    ON telegram_updates(status, update_id)
+    WHERE status = 'pending_dispatch';
 
 -- Persisted poller offset: resume from here after restart (T2).
 CREATE TABLE IF NOT EXISTS telegram_offsets (

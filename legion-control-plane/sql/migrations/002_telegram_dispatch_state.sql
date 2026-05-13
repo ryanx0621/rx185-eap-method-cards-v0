@@ -1,0 +1,26 @@
+-- 002: Telegram dispatch state machine (Phase 2.2)
+--
+-- This file documents the migration semantics. The actual ALTER TABLE
+-- statements are issued by the Rust migration runner (db.rs) after
+-- inspecting PRAGMA table_info(telegram_updates), because SQLite's
+-- ALTER TABLE ADD COLUMN does not universally support IF NOT EXISTS.
+--
+-- Runner steps (executed in order, all idempotent):
+--   1.  PRAGMA table_info(telegram_updates) -> column set
+--   2.  if 'dispatched_at'   not present: ALTER TABLE telegram_updates ADD COLUMN dispatched_at TEXT;
+--   3.  if 'dispatch_error'  not present: ALTER TABLE telegram_updates ADD COLUMN dispatch_error TEXT;
+--   4.  UPDATE telegram_updates SET status='pending_dispatch' WHERE status='received';
+--   5.  CREATE INDEX IF NOT EXISTS idx_telegram_updates_pending
+--          ON telegram_updates(status, update_id)
+--          WHERE status='pending_dispatch';
+--
+-- A pure-SQL fallback (will fail noisily on a second run because ALTER
+-- ADD COLUMN has no IF NOT EXISTS in older SQLite — kept here only as a
+-- reference of the target shape):
+--
+--   ALTER TABLE telegram_updates ADD COLUMN dispatched_at TEXT;
+--   ALTER TABLE telegram_updates ADD COLUMN dispatch_error TEXT;
+--   UPDATE telegram_updates SET status='pending_dispatch' WHERE status='received';
+--   CREATE INDEX IF NOT EXISTS idx_telegram_updates_pending
+--       ON telegram_updates(status, update_id)
+--       WHERE status='pending_dispatch';
