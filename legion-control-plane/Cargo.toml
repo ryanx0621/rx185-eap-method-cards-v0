@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/legion-types",
     "crates/legion-bus",
+    "crates/legion-telegram",
 ]
 
 [workspace.package]
@@ -37,3 +38,9 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async trait support
+async-trait = "0.1"
+
+# HTTP client (real Telegram API)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

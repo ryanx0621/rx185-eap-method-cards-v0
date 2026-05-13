@@ -1,0 +1,32 @@
+[package]
+name = "legion-telegram"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+legion-types = { path = "../legion-types" }
+legion-bus    = { path = "../legion-bus" }
+rusqlite      = { workspace = true }
+
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+chrono       = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+async-trait  = { workspace = true }
+
+# Gate real HTTP behind the "http" feature so tests compile without network.
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = ["http"]
+http = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio              = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber = { workspace = true }
